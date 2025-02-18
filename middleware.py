@@ -10,7 +10,6 @@ OPC_UA_SERVER = "opc.tcp://localhost:4840/freeopcua/server/"
 BROKER = "localhost"
 PORT = 1883
 GROUP_ID = "Production"
-EDGE_NODE_ID = "Machine01"
 SCAN_INTERVAL = 10  # Segundos entre actualizaciones
 
 # Mapeo manual de tipos de datos OPC UA a Sparkplug B
@@ -28,19 +27,26 @@ DATA_TYPE_MAP = {
 
 class SparkplugConverter(SubHandler):
     def __init__(self):
+        # -- MQTT y OPC UA --
         self.mqtt_client = mqtt.Client()
         self.opcua_client = Client(OPC_UA_SERVER)
-        self.metrics_metadata = {}
-        self.seq_number = 0
+        
+        # Diccionario principal: { 
+        #   "Device_1": {
+        #       "metrics": { node_id: {...}, ... },
+        #       "seq": 0  # Secuencia Sparkplug independiente
+        #   }, 
+        #   "Device_2": {...},
+        #   ...
+        # }
+        self.devices = {}
+
         self.subscription = None
         self.subscription_handles = []
-        self.edge_node_id = None  # Inicializar EDGE_NODE_ID
-        
-        # Configurar callbacks MQTT
+
+        # Conectar al broker MQTT
         self.mqtt_client.on_connect = self._on_mqtt_connect
         self.mqtt_client.on_disconnect = self._on_mqtt_disconnect
-        
-        # Conectar al broker MQTT
         try:
             self.mqtt_client.connect(BROKER, PORT)
             self.mqtt_client.loop_start()  # Iniciar loop en background
@@ -48,49 +54,20 @@ class SparkplugConverter(SubHandler):
         except Exception as e:
             print(f"Error conectando al broker MQTT: {str(e)}")
 
+    # ---------------------------------------------------
+    #   Callbacks MQTT
+    # ---------------------------------------------------
     def _on_mqtt_connect(self, client, userdata, flags, rc):
-        """Callback cuando se conecta al broker MQTT"""
         print(f"Conectado al broker MQTT con código: {rc}")
-        if rc == 0:
-            # Publicar NBIRTH al conectar
-            self._publish_birth()
-        else:
+        if rc != 0:
             print(f"Error conectando al broker MQTT. Código: {rc}")
 
     def _on_mqtt_disconnect(self, client, userdata, rc):
-        """Callback cuando se desconecta del broker MQTT"""
         print(f"Desconectado del broker MQTT con código: {rc}")
 
-    def _process_variable_node(self, node):
-        try:
-            display_name = node.get_display_name().Text
-            node_id = str(node.nodeid)
-            
-            # Obtener valor y tipo de dato
-            value = node.get_value()
-            data_type = node.get_data_type_as_variant_type()
-            
-            # Mapear el tipo de dato de OPC UA a Sparkplug B
-            sparkplug_type = self._map_data_type(data_type)
-
-            if sparkplug_type == 0:
-                print(f"Tipo de dato no soportado para el nodo {display_name}")
-                return
-
-            # Timestamp actual
-            timestamp = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-            
-            self.metrics_metadata[display_name] = {
-                "node_id": node_id,
-                "data_type": sparkplug_type,
-                "timestamp": timestamp,
-                "value": value
-            }
-            
-            print(f"Métrica procesada: {display_name} = {value} (Tipo: {data_type})")
-        except Exception as e:
-            print(f"Error procesando variable: {str(e)}")
-
+    # ---------------------------------------------------
+    #   Descubrimiento y Procesamiento de Nodos
+    # ---------------------------------------------------
     def _map_data_type(self, ua_type):
         """Mapea tipos de OPC UA a tipos Sparkplug B"""
         type_mapping = {
@@ -106,86 +83,262 @@ class SparkplugConverter(SubHandler):
         }
         return type_mapping.get(ua_type, 0)
 
-    def provision_specific_node(self, node_path):
+    def _process_device_node(self, device_name, device_node):
         """
-        Autoaprovisiona un nodo específico dado su ruta.
-        :param node_path: Lista de pasos para llegar al nodo, e.g., ["Objects", "Boilers", "Boiler #1", "CC1001"]
+        Procesa un nodo de tipo "Device_X" y registra sus variables en self.devices.
+        """
+        # Crear la entrada para este dispositivo si no existe
+        if device_name not in self.devices:
+            self.devices[device_name] = {
+                "metrics": {},
+                "seq": 0  # Secuencia independiente para cada dispositivo
+            }
+            print(f"🔧 Registrado nuevo dispositivo: {device_name}")
+
+        # Obtener los hijos del dispositivo (variables)
+        children = device_node.get_children()
+        for child in children:
+            try:
+                if child.get_node_class() == ua.NodeClass.Variable:
+                    self._process_variable_node(device_name, child)
+                    self.subscribe_to_node(child)
+                elif child.get_node_class() == ua.NodeClass.Object:
+                    # Si hay más objetos anidados, podrías decidir si seguir explorando
+                    # o tratarlo como "sub-objetos" del mismo dispositivo.
+                    # Ejemplo recursivo:
+                    self._process_device_node(device_name, child)
+            except Exception as e:
+                print(f"⚠️ Error procesando variable/objeto de {device_name}: {str(e)}")
+
+        # Una vez procesado, publicar NBIRTH para este dispositivo
+        self._publish_device_birth(device_name)
+
+    def _process_variable_node(self, device_name, node):
+        """
+        Procesa una variable (nodo) y la registra dentro del dispositivo correspondiente.
         """
         try:
-            # Navegar hasta el nodo específico
-            node = self.opcua_client.get_root_node()
-            for step in node_path:
-                node = node.get_child(f"2:{step}")  # Ajusta el índice '2' según tu namespace
+            display_name = node.get_display_name().Text
+            node_id = str(node.nodeid)
+            value = node.get_value()
+            data_type = node.get_data_type_as_variant_type()
+            sparkplug_type = self._map_data_type(data_type)
 
-            # Verificar el tipo del nodo
-            node_class = node.get_node_class().name
-            if node_class != "Object":
-                print(f"El nodo {node_path[-1]} no es del tipo 'Object'.")
+            if sparkplug_type == 0:
+                print(f"⚠️ Tipo de dato no soportado para el nodo {display_name}")
                 return
 
-            # Descubrir referencias y propiedades
-            print(f"Descubriendo propiedades del nodo {node_path[-1]}...")
-            references = node.get_references()
-            for ref in references:
-                if ref.ReferenceTypeName == "HasProperty":
-                    prop = self.opcua_client.get_node(ref.NodeId)
-                    self._process_variable_node(prop)
+            timestamp = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
-            print(f"Propiedades del nodo {node_path[-1]} autoaprovisionadas.")
+            self.devices[device_name]["metrics"][node_id] = {
+                "name": display_name,
+                "node_id": node_id,
+                "data_type": sparkplug_type,
+                "timestamp": timestamp,
+                "value": value
+            }
+            print(f"✅ [{device_name}] Métrica procesada: {display_name} = {value}")
+
         except Exception as e:
-            print(f"Error autoaprovisionando el nodo: {str(e)}")
+            print(f"🚨 Error procesando variable: {str(e)}")
 
+    def discover_nodes(self):
+        """
+        Descubre automáticamente los nodos de tipo 'Device_X' y sus variables
+        en el servidor OPC UA, y los registra en self.devices.
+        """
+        try:
+            print(f"Iniciando descubrimiento automático de nodos en {OPC_UA_SERVER}")
+            root = self.opcua_client.get_root_node()
+            objects = root.get_child(["0:Objects"])
+
+            def browse_recursive(node, current_path=""):
+                try:
+                    node_name = node.get_browse_name().Name if node.get_browse_name() else "Desconocido"
+                    node_id = str(node.nodeid)
+
+                    # Evitar el nodo "Server"
+                    if node_name == "Server":
+                        return
+
+                    new_path = f"{current_path}/{node_name}" if current_path else node_name
+                    print(f"📌 Explorando nodo: {node_name} (ID: {node_id}) -> {new_path}")
+
+                    # Si parece un dispositivo (ej. "Device_1", "Device_2", etc.)
+                    # Puedes cambiar la lógica si tus nodos tienen otro naming
+                    if node_name.startswith("Device_"):
+                        # Procesar como un dispositivo
+                        self._process_device_node(node_name, node)
+                    else:
+                        # Sino, solo explora sus hijos
+                        children = node.get_children()
+                        for child in children:
+                            browse_recursive(child, new_path)
+
+                except Exception as e:
+                    print(f"🚨 Error en browse_recursive: {str(e)}")
+
+            # Recorrer recursivamente el nodo Objects
+            browse_recursive(objects)
+
+            # Al final, imprime un resumen
+            total_devices = len(self.devices)
+            total_metrics = sum(len(d["metrics"]) for d in self.devices.values())
+            print(f"🔍 Descubrimiento completado. Dispositivos: {total_devices}, Métricas totales: {total_metrics}")
+
+        except Exception as e:
+            print(f"Error en descubrimiento de nodos: {str(e)}")
+
+    # ---------------------------------------------------
+    #   Publicar BIRTH y DATA (por dispositivo)
+    # ---------------------------------------------------
+    def _publish_device_birth(self, device_name):
+        """
+        Publica un NBIRTH para el dispositivo especificado.
+        """
+        try:
+            device_data = self.devices[device_name]
+            payload = Payload()
+            payload.timestamp = int(time.time() * 1000)
+            payload.seq = device_data["seq"]
+
+            # Añadir todas las métricas del dispositivo
+            for node_id, metric_info in device_data["metrics"].items():
+                metric = payload.metrics.add()
+                metric.name = metric_info["name"]
+                metric.timestamp = int(time.time() * 1000)
+                metric.datatype = metric_info["data_type"]
+
+                # Asignar valor según el tipo
+                val = metric_info["value"]
+                dt = metric_info["data_type"]
+                if dt == 10:     # Double
+                    metric.double_value = float(val)
+                elif dt == 11:  # Float
+                    metric.float_value = float(val)
+                elif dt in [7, 8]:  # Int32/Int64
+                    metric.int_value = int(val)
+                elif dt == 12:  # Boolean
+                    metric.boolean_value = bool(val)
+                elif dt == 13:  # String
+                    metric.string_value = str(val)
+                elif dt == 16:  # DateTime
+                    if isinstance(val, datetime.datetime):
+                        metric.long_value = int(val.timestamp() * 1000)
+                    else:
+                        metric.long_value = int(time.time() * 1000)
+                elif dt == 2:   # Byte
+                    metric.int_value = int(val)
+
+            # Publicar NBIRTH en spBv1.0/<GROUP_ID>/NBIRTH/<device_name>
+            topic = f"spBv1.0/{GROUP_ID}/NBIRTH/{device_name}"
+            self.mqtt_client.publish(topic, payload.SerializeToString())
+            print(f"📡 NBIRTH publicado en {topic}")
+
+        except Exception as e:
+            print(f"Error publicando NBIRTH para {device_name}: {str(e)}")
+
+    def _publish_device_data(self, device_name, changed_node_id=None):
+        """
+        Publica NDATA para un dispositivo concreto. 
+        Si changed_node_id no es None, se publica solo esa métrica; 
+        de lo contrario, se publican todas.
+        """
+        try:
+            device_data = self.devices[device_name]
+            device_data["seq"] = (device_data["seq"] + 1) % 256
+
+            payload = Payload()
+            payload.timestamp = int(time.time() * 1000)
+            payload.seq = device_data["seq"]
+
+            # Determinar si publicamos solo una métrica o todas
+            if changed_node_id:
+                metric_infos = {
+                    changed_node_id: device_data["metrics"][changed_node_id]
+                }
+            else:
+                metric_infos = device_data["metrics"]
+
+            for node_id, metric_info in metric_infos.items():
+                metric = payload.metrics.add()
+                metric.name = metric_info["name"]
+                metric.timestamp = int(time.time() * 1000)
+                metric.datatype = metric_info["data_type"]
+
+                val = metric_info["value"]
+                dt = metric_info["data_type"]
+                if dt == 10:     # Double
+                    metric.double_value = float(val)
+                elif dt == 11:  # Float
+                    metric.float_value = float(val)
+                elif dt in [7, 8]:  # Int32/Int64
+                    metric.int_value = int(val)
+                elif dt == 12:  # Boolean
+                    metric.boolean_value = bool(val)
+                elif dt == 13:  # String
+                    metric.string_value = str(val)
+                elif dt == 16:  # DateTime
+                    if isinstance(val, datetime.datetime):
+                        metric.long_value = int(val.timestamp() * 1000)
+                    else:
+                        metric.long_value = int(time.time() * 1000)
+                elif dt == 2:   # Byte
+                    metric.int_value = int(val)
+
+            # Publicar NDATA en spBv1.0/<GROUP_ID>/NDATA/<device_name>
+            topic = f"spBv1.0/{GROUP_ID}/NDATA/{device_name}"
+            self.mqtt_client.publish(topic, payload.SerializeToString())
+            print(f"📡 NDATA publicado en {topic} (device: {device_name})")
+
+        except Exception as e:
+            print(f"Error publicando NDATA para {device_name}: {str(e)}")
+
+    # ---------------------------------------------------
+    #   Callbacks de suscripción OPC UA
+    # ---------------------------------------------------
     def datachange_notification(self, node, val, data):
-        """Callback para cambios en los valores de los nodos"""
+        """
+        Callback para notificaciones de cambio de valor en OPC UA.
+        Identifica a qué dispositivo pertenece la variable y publica NDATA.
+        """
         try:
             node_id = str(node.nodeid)
-            
-            # Buscar el display_name en metrics_metadata
-            display_name = None
-            for name, metadata in self.metrics_metadata.items():
-                if metadata['node_id'] == node_id:
-                    display_name = name
+            device_name = None
+
+            # Encontrar a qué dispositivo pertenece este node_id
+            for d_name, d_data in self.devices.items():
+                if node_id in d_data["metrics"]:
+                    device_name = d_name
                     break
-            
-            if display_name is None:
-                print(f"Warning: No se encontró display_name para el nodeId {node_id}")
+
+            if not device_name:
+                print(f"⚠️ No se encontró dispositivo para nodeId {node_id}")
                 return
-                
-            print(f"Cambio detectado:")
-            print(f"  Nodo: {display_name}")
-            print(f"  Valor nuevo: {val}")
-            
-            # Actualizar el valor en metrics_metadata
-            self.metrics_metadata[display_name]["value"] = val
-            self.metrics_metadata[display_name]["timestamp"] = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-            
-            # Crear payload y publicar NDATA
-            try:
-                payload = self.create_sparkplug_payload()
-                if payload and payload.metrics:
-                    topic = self._get_topic("NDATA")
-                    self.mqtt_client.publish(topic, payload.SerializeToString())
-                    print(f"NDATA publicado en {topic}")
-                else:
-                    print("No hay métricas para publicar")
-            except Exception as e:
-                print(f"Error publicando NDATA: {str(e)}")
-                import traceback
-                traceback.print_exc()
-            
+
+            # Actualizar el valor
+            self.devices[device_name]["metrics"][node_id]["value"] = val
+            self.devices[device_name]["metrics"][node_id]["timestamp"] = \
+                datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+            display_name = self.devices[device_name]["metrics"][node_id]["name"]
+            print(f"🔄 Cambio detectado: {device_name}.{display_name} = {val}")
+
+            # Publicar NDATA SOLO para este dispositivo
+            self._publish_device_data(device_name, changed_node_id=node_id)
+
         except Exception as e:
-            print(f"Error en el callback de cambio de datos: {str(e)}")
-            import traceback
-            traceback.print_exc()
+            print(f"🚨 Error en datachange_notification: {str(e)}")
 
     def event_notification(self, event):
-        """Callback para notificaciones de eventos"""
         print("Evento recibido:", event)
 
     def status_change_notification(self, status):
-        """Callback para cambios de estado"""
         print("Cambio de estado:", status)
 
+    # ---------------------------------------------------
+    #   Suscripciones
+    # ---------------------------------------------------
     def subscribe_to_node(self, node):
         """Suscribe a los cambios de un nodo específico"""
         try:
@@ -194,250 +347,32 @@ class SparkplugConverter(SubHandler):
                 print("Creando nueva suscripción...")
                 self.subscription = self.opcua_client.create_subscription(
                     period=500,
-                    handler=self,
-
+                    handler=self
                 )
                 print("Suscripción creada exitosamente")
             
-            print(f"Suscribiendo a cambios de datos...")
-            print(f"Tipo de nodo: {type(node)}")
-            print(f"Nombre del nodo: {node.get_display_name().Text}")
-            print(f"NodeId: {node.nodeid}")
-            
+            print(f"Suscribiendo a cambios de datos en: {node.get_display_name().Text}")
             handle = self.subscription.subscribe_data_change(node)
             self.subscription_handles.append(handle)
-            print(f"Suscrito exitosamente a cambios en {node.get_display_name().Text}")
+            print(f"Suscrito exitosamente a {node.get_display_name().Text}")
+
         except Exception as e:
             print(f"Error al suscribirse al nodo: {str(e)}")
-            print(f"Tipo de error: {type(e)}")
             import traceback
             traceback.print_exc()
 
-    def add_sensor(self, sensor_path):
-        """
-        Añade un nuevo sensor para monitoreo
-        :param sensor_path: Lista con la ruta al sensor, e.g., ["Sensor", "Temperature"]
-        """
-        try:
-            # Navegar hasta el nodo del sensor
-            node = self.opcua_client.get_root_node()
-            objects = node.get_child(["0:Objects"])
-            
-            current_node = objects
-            for step in sensor_path:
-                current_node = current_node.get_child([f"2:{step}"])
-            
-            # Procesar el nodo
-            self._process_variable_node(current_node)
-            
-            # Suscribirse a cambios
-            self.subscribe_to_node(current_node)
-            
-            return True
-            
-        except Exception as e:
-            print(f"Error añadiendo sensor {'/'.join(sensor_path)}: {str(e)}")
-            return False
-
-    def _print_payload(self, payload):
-        """Imprime el payload de forma legible"""
-        print("\nPayload Sparkplug generado:")
-        for metric in payload.metrics:
-            print(f"Nombre: {metric.name}")
-            if metric.datatype == 10:  # Double
-                print(f"Valor: {metric.double_value}")
-            elif metric.datatype == 11:  # Float
-                print(f"Valor: {metric.float_value}")
-            elif metric.datatype in [7, 8]:  # Int32/Int64
-                print(f"Valor: {metric.int_value}")
-            elif metric.datatype == 12:  # Boolean
-                print(f"Valor: {metric.boolean_value}")
-            print(f"Timestamp: {metric.timestamp}")
-            print("---")
-
-    def test_specific_nodes(self):
-        """Prueba la conexión con múltiples sensores"""
-        # Lista de sensores a monitorear
-        sensors = [
-            ["Sensor", "Temperature"],
-            # ["Sensor", "Pressure"],
-            # Añade más sensores según necesites
-        ]
-
-        for sensor_path in sensors:
-            print(f"\nConectando al sensor: {'/'.join(sensor_path)}")
-            if self.add_sensor(sensor_path):
-                print(f"Sensor {'/'.join(sensor_path)} añadido correctamente")
-
-    def create_sparkplug_payload(self):
-        """Crea un payload Sparkplug B con los datos actuales"""
-        payload = Payload()
-        payload.timestamp = int(time.time() * 1000)  # Timestamp en milisegundos
-        
-        for name, metadata in self.metrics_metadata.items():
-            try:
-                metric = payload.metrics.add()
-                metric.name = name
-                metric.timestamp = int(time.mktime(
-                    datetime.datetime.strptime(
-                        metadata['timestamp'], 
-                        "%Y-%m-%dT%H:%M:%S.%fZ"
-                    ).timetuple()
-                )) * 1000  # Timestamp en milisegundos
-                metric.datatype = metadata['data_type']
-                
-                # Verificar si el valor es None
-                if metadata['value'] is None:
-                    print(f"Warning: Valor None para la métrica {name}")
-                    continue
-                
-                # Asignar valor según el tipo de dato
-                match metadata['data_type']:
-                    case 10:  # Double
-                        metric.double_value = float(metadata['value'])
-                    case 11:  # Float
-                        metric.float_value = float(metadata['value'])
-                    case 7 | 8:  # Int32/Int64
-                        metric.int_value = int(metadata['value'])
-                    case 12:  # Boolean
-                        metric.boolean_value = bool(metadata['value'])
-                    case 13:  # String
-                        metric.string_value = str(metadata['value'])
-                    case 16:  # DateTime
-                        if isinstance(metadata['value'], datetime.datetime):
-                            metric.long_value = int(metadata['value'].timestamp() * 1000)
-                        else:
-                            metric.long_value = int(time.time() * 1000)
-                    case 2:  # Byte
-                        metric.int_value = int(metadata['value'])
-                    case _:
-                        print(f"Tipo de dato no soportado: {metadata['data_type']}")
-                        continue
-            except Exception as e:
-                print(f"Error procesando métrica {name}: {str(e)}")
-                continue
-        
-        # Incrementar y establecer el número de secuencia
-        self.seq_number = (self.seq_number + 1) % 256
-        payload.seq = self.seq_number
-        
-        return payload
-
-    def _publish_birth(self):
-        """Publica el mensaje NBIRTH con la configuración inicial"""
-        try:
-            payload = Payload()
-            payload.timestamp = int(time.time() * 1000)
-            payload.seq = self.seq_number
-            
-            # Añadir todas las métricas conocidas
-            for name, metadata in self.metrics_metadata.items():
-                metric = payload.metrics.add()
-                metric.name = name
-                metric.timestamp = int(time.time() * 1000)
-                metric.datatype = metadata['data_type']
-                
-                # Establecer el valor inicial
-                match metadata['data_type']:
-                    case 10:  # Double
-                        metric.double_value = float(metadata['value'])
-                    case 11:  # Float
-                        metric.float_value = float(metadata['value'])
-                    case 7 | 8:  # Int32/Int64
-                        metric.int_value = int(metadata['value'])
-                    case 12:  # Boolean
-                        metric.boolean_value = bool(metadata['value'])
-                    case 13:  # String
-                        metric.string_value = str(metadata['value'])
-                    case 16:  # DateTime
-                        metric.long_value = int(metadata['value'].timestamp() * 1000)
-                    case _:
-                        print(f"Tipo de dato no soportado: {metadata['data_type']}")
-                        continue
-
-            # Publicar el mensaje NBIRTH
-            topic = self._get_topic("NBIRTH")
-            self.mqtt_client.publish(topic, payload.SerializeToString())
-            print(f"NBIRTH publicado en {topic}")
-            
-        except Exception as e:
-            print(f"Error publicando NBIRTH: {str(e)}")
-            import traceback
-            traceback.print_exc()
-
-    def _get_topic(self, message_type):
-        """
-        Genera el topic Sparkplug B según el tipo de mensaje
-        :param message_type: Tipo de mensaje (NBIRTH, NDATA, NDEATH)
-        :return: Topic formateado
-        """
-        return f"spBv1.0/{GROUP_ID}/{message_type}/{self.edge_node_id}"  # Usar EDGE_NODE_ID dinámico
-
-    def discover_nodes(self):
-        """Descubre automáticamente los nodos variables relevantes del servidor"""
-        try:
-            print(f"Iniciando descubrimiento automático de nodos en {OPC_UA_SERVER}")
-            root = self.opcua_client.get_root_node()
-            objects = root.get_child(["0:Objects"])
-            
-            def browse_recursive(node, current_path=""):
-                """Navega recursivamente por los nodos relevantes"""
-                try:
-                    # Obtener el nombre del nodo actual
-                    node_name = node.get_display_name().Text
-                    
-                    # Saltar el nodo Server y sus descendientes
-                    if node_name == "Server":
-                        return
-                    
-                    # Asignar EDGE_NODE_ID basado en la ruta del nodo
-                    self.edge_node_id = f"{current_path}/{node_name}"  # Usar la ruta completa como EDGE_NODE_ID
-
-                    # Actualizar la ruta actual
-                    new_path = f"{current_path}/{node_name}" if current_path else node_name
-                    print(f"Explorando nodo: {new_path}")
-                    
-                    for child in node.get_children():
-                        try:
-                            node_class = child.get_node_class()
-                            
-                            # Si es una variable, procesarla
-                            if node_class == ua.NodeClass.Variable:
-                                print(f"Encontrada variable: {child.get_display_name().Text}")
-                                self._process_variable_node(child)
-                                self.subscribe_to_node(child)
-                            
-                            # Si es un objeto, explorar sus hijos
-                            elif node_class == ua.NodeClass.Object:
-                                browse_recursive(child, new_path)
-                                
-                        except Exception as e:
-                            print(f"Error procesando nodo hijo: {str(e)}")
-                            continue
-                            
-                except Exception as e:
-                    print(f"Error en browse_recursive: {str(e)}")
-
-            # Comenzar el descubrimiento desde el nodo Objects
-            browse_recursive(objects)
-            
-            print("Descubrimiento de nodos completado")
-            print(f"Nodos encontrados: {len(self.metrics_metadata)}")
-            
-        except Exception as e:
-            print(f"Error en descubrimiento de nodos: {str(e)}")
-
+    # ---------------------------------------------------
+    #   Ejecución Principal
+    # ---------------------------------------------------
     def run(self):
-        """Bucle principal de ejecución"""
         try:
-            # Conexión inicial OPC UA
             self.opcua_client.connect()
             print(f"Conectado a servidor OPC UA: {OPC_UA_SERVER}")
 
-            # Descubrir automáticamente todos los nodos
+            # Descubrir todos los nodos (dispositivos y variables)
             self.discover_nodes()
 
-            # Mantener el programa en ejecución
+            # Bucle principal
             while True:
                 time.sleep(1)
 
@@ -447,10 +382,13 @@ class SparkplugConverter(SubHandler):
             if self.subscription:
                 self.subscription.delete()
             self.opcua_client.disconnect()
-            self.mqtt_client.loop_stop()  # Detener el loop MQTT
+            self.mqtt_client.loop_stop()
             self.mqtt_client.disconnect()
             print("Desconexión limpia completada")
 
+# ---------------------------------------------------
+#   Arranque
+# ---------------------------------------------------
 if __name__ == "__main__":
     converter = SparkplugConverter()
     converter.run()
