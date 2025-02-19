@@ -4,13 +4,14 @@ from opcua import Client, ua
 import paho.mqtt.client as mqtt
 from core.sparkplug_b_pb2 import Payload
 from opcua.common.subscription import SubHandler
+import os
 
 # Configuración mejorada
-OPC_UA_SERVER = "opc.tcp://localhost:4840/freeopcua/server/"
-BROKER = "localhost"
-PORT = 1883
-GROUP_ID = "Production"
-SCAN_INTERVAL = 10  # Segundos entre actualizaciones
+OPC_UA_SERVER = os.environ.get("OPC_UA_SERVER", "opc.tcp://localhost:4840/freeopcua/server/")
+BROKER = os.environ.get("BROKER", "localhost")
+PORT = int(os.environ.get("PORT", 1883))
+GROUP_ID = os.environ.get("GROUP_ID", "Production")
+SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL", 10))  # Segundos entre actualizaciones
 
 # Mapeo manual de tipos de datos OPC UA a Sparkplug B
 DATA_TYPE_MAP = {

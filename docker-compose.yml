@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  sparkplug_converter:
+    build: .
+    environment:
+      OPC_UA_SERVER: "opc.tcp://host.docker.internal:4840/freeopcua/server/"
+      BROKER: "host.docker.internal"
+      PORT: 1883
+      GROUP_ID: "Production"
+      SCAN_INTERVAL: 10
+    #restart: always
